@@ -126,6 +126,7 @@ class AppConfig(BaseSettings):
         env_file=(".env",),  # will read if present
         env_file_encoding="utf-8",
         frozen=True,  # make settings immutable
+        extra="ignore",
     )
 
     # ---- validators ----
