@@ -78,11 +78,11 @@ class AppConfig(BaseSettings):
     # ---- remote API configuration ----
     api_token: Optional[str] = Field(
         default=None,
-        description="Bearer token for Granola API authentication (remote source)",
+        description="Bearer token for Granola public API (grn_... format). Set via GRANOLA_API_TOKEN env var.",
     )
     api_base: str = Field(
-        default="https://api.granola.ai",
-        description="Base URL for the Granola API",
+        default="https://public-api.granola.ai",
+        description="Base URL for the Granola public API",
     )
     
     # ---- cache configuration ----

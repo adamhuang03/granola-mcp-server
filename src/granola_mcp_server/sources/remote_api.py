@@ -1,12 +1,11 @@
 """Remote API-based document source.
 
-Fetches documents directly from the Granola API using token authentication.
-Handles gzip decompression and caching of the decompressed JSON.
+Fetches documents directly from the Granola public API using token authentication.
+Handles caching of JSON responses with TTL-based invalidation and retry logic.
 """
 
 from __future__ import annotations
 
-import gzip
 import hashlib
 import json
 import time
@@ -21,191 +20,204 @@ from ..document_source import DocumentSource
 
 
 class RemoteApiDocumentSource(DocumentSource):
-    """Document source that fetches from the Granola API.
-    
+    """Document source that fetches from the Granola public API.
+
     Features:
-    - Token-based authentication
-    - Gzip decompression of responses
-    - Local caching of decompressed JSON
-    - TTL-based cache invalidation
+    - Token-based authentication (Bearer grn_...)
+    - Cursor-based pagination across all pages up to limit
+    - Per-document detail fetching via /v1/notes/{id}?include=transcript
+    - Local caching of responses with TTL-based invalidation
     - Retry logic with exponential backoff
-    
+
     Args:
-        token: Bearer token for API authentication.
-        api_base: Base URL for the Granola API.
-        cache_dir: Directory for storing decompressed cache files.
+        token: Bearer token for API authentication (GRANOLA_API_TOKEN).
+        api_base: Base URL for the Granola public API.
+        cache_dir: Directory for storing cache files.
         cache_ttl_seconds: Time-to-live for cached data (default 24h).
     """
 
     def __init__(
         self,
         token: str,
-        api_base: str = "https://api.granola.ai",
+        api_base: str = "https://public-api.granola.ai",
         cache_dir: Optional[str | Path] = None,
         cache_ttl_seconds: int = 86400,  # 24 hours
     ):
         self.token = token
         self.api_base = api_base.rstrip("/")
         self.cache_ttl = cache_ttl_seconds
-        
+
         # Set up cache directory
         if cache_dir is None:
             cache_dir = Path.home() / ".granola" / "remote_cache"
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        
-    def _get_cache_key(
-        self,
-        limit: Optional[int],
-        offset: Optional[int],
-        include_last_viewed_panel: bool,
-    ) -> str:
-        """Generate cache key for request parameters."""
-        params = f"{limit}:{offset}:{include_last_viewed_panel}"
-        return hashlib.sha256(params.encode()).hexdigest()[:16]
-    
-    def _get_cache_path(self, cache_key: str) -> Path:
-        """Get cache file path for a cache key."""
-        return self.cache_dir / f"docs_{cache_key}.json"
-    
+
+    def _get_cache_path(self, name: str) -> Path:
+        """Get cache file path for a given name/key."""
+        safe = hashlib.sha256(name.encode()).hexdigest()[:16]
+        return self.cache_dir / f"docs_{safe}.json"
+
     def _is_cache_fresh(self, cache_path: Path) -> bool:
         """Check if cache file is within TTL."""
         if not cache_path.exists():
             return False
-        
         age = time.time() - cache_path.stat().st_mtime
         return age < self.cache_ttl
-    
-    def _read_cache(self, cache_path: Path) -> Optional[Dict[str, object]]:
+
+    def _read_cache(self, cache_path: Path) -> Optional[object]:
         """Read from cache file."""
         if not cache_path.exists():
             return None
-        
         try:
             with cache_path.open("r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             return None
-    
-    def _write_cache(self, cache_path: Path, data: Dict[str, object]) -> None:
+
+    def _write_cache(self, cache_path: Path, data: object) -> None:
         """Write to cache file."""
         try:
             with cache_path.open("w", encoding="utf-8") as f:
                 json.dump(data, f)
         except Exception as e:
-            # Non-fatal: cache write failures shouldn't break the request
             print(f"Warning: Failed to write cache: {e}")
-    
-    def _fetch_from_api(
-        self,
-        limit: int = 100,
-        offset: int = 0,
-        include_last_viewed_panel: bool = True,
-    ) -> Dict[str, object]:
-        """Fetch documents from the Granola API.
-        
+
+    def _make_request(self, url: str) -> Dict[str, object]:
+        """Execute a GET request against the public API with retry logic.
+
+        Args:
+            url: Full URL to fetch.
+
         Returns:
-            Parsed JSON response after gzip decompression.
-            
+            Parsed JSON response dict.
+
         Raises:
             GranolaParseError: For network or parsing errors.
         """
-        url = f"{self.api_base}/v2/get-documents"
-        
-        payload = json.dumps({
-            "limit": limit,
-            "offset": offset,
-            "include_last_viewed_panel": include_last_viewed_panel,
-        }).encode("utf-8")
-        
         headers = {
             "Authorization": f"Bearer {self.token}",
-            "Content-Type": "application/json",
-            "Accept": "*/*",
+            "Accept": "application/json",
             "User-Agent": "Granola-MCP-Server/0.1.0",
         }
-        
-        req = request.Request(url, data=payload, headers=headers, method="POST")
-        
+
+        req = request.Request(url, headers=headers, method="GET")
+
         max_retries = 3
         for attempt in range(max_retries):
             try:
                 with request.urlopen(req, timeout=30) as response:
                     raw_data = response.read()
-
-                    # Try gzip decompression, fall back to raw
                     try:
-                        body = gzip.decompress(raw_data)
-                    except Exception:
-                        body = raw_data
-
-                    # Parse JSON
-                    try:
-                        data = json.loads(body.decode("utf-8"))
+                        data = json.loads(raw_data.decode("utf-8"))
                         return data
                     except Exception as e:
                         raise GranolaParseError(
                             f"Failed to parse JSON: {e}",
-                            {"attempt": attempt + 1}
+                            {"attempt": attempt + 1, "url": url},
                         ) from e
-                        
+
             except HTTPError as e:
                 error_code = e.code
                 error_body = e.read().decode("utf-8", errors="replace")
-                
+
                 if error_code == 401:
                     raise GranolaParseError(
-                        "Invalid or expired token. Please reauthenticate.",
-                        {"status": 401}
+                        "Invalid or expired token. Please check GRANOLA_API_TOKEN.",
+                        {"status": 401},
                     ) from e
                 elif error_code == 403:
                     raise GranolaParseError(
                         "Access forbidden. Check your token permissions.",
-                        {"status": 403}
+                        {"status": 403},
                     ) from e
                 elif error_code == 429:
-                    # Rate limited - retry with backoff
                     if attempt < max_retries - 1:
-                        wait = (2 ** attempt) * 1.0  # Exponential backoff
-                        time.sleep(wait)
+                        time.sleep((2 ** attempt) * 1.0)
                         continue
                     raise GranolaParseError(
                         "Rate limit exceeded. Please try again later.",
-                        {"status": 429, "attempt": attempt + 1}
+                        {"status": 429, "attempt": attempt + 1},
                     ) from e
                 elif 500 <= error_code < 600:
-                    # Server error - retry
                     if attempt < max_retries - 1:
-                        wait = (2 ** attempt) * 1.0
-                        time.sleep(wait)
+                        time.sleep((2 ** attempt) * 1.0)
                         continue
                     raise GranolaParseError(
                         f"Server error: {error_code}",
-                        {"status": error_code, "body": error_body, "attempt": attempt + 1}
+                        {"status": error_code, "body": error_body, "attempt": attempt + 1},
                     ) from e
                 else:
                     raise GranolaParseError(
                         f"HTTP error: {error_code}",
-                        {"status": error_code, "body": error_body}
+                        {"status": error_code, "body": error_body},
                     ) from e
-                    
+
             except URLError as e:
                 if attempt < max_retries - 1:
-                    wait = (2 ** attempt) * 1.0
-                    time.sleep(wait)
+                    time.sleep((2 ** attempt) * 1.0)
                     continue
                 raise GranolaParseError(
                     f"Network error: {e.reason}",
-                    {"attempt": attempt + 1}
+                    {"attempt": attempt + 1},
                 ) from e
-                
+
+            except GranolaParseError:
+                raise
+
             except Exception as e:
                 raise GranolaParseError(
                     f"Unexpected error: {e}",
-                    {"attempt": attempt + 1}
+                    {"attempt": attempt + 1},
                 ) from e
-        
+
         raise GranolaParseError("Failed after max retries")
+
+    def _fetch_from_api(
+        self,
+        limit: int = 100,
+        created_after: Optional[str] = None,
+    ) -> List[Dict[str, object]]:
+        """Fetch all notes from GET /v1/notes, following cursor pagination.
+
+        Collects pages until there are no more results or `limit` is reached.
+
+        Args:
+            limit: Maximum total notes to return across all pages.
+            created_after: Optional ISO 8601 lower bound for created_at.
+
+        Returns:
+            List of note dicts from the API.
+        """
+        all_notes: List[Dict[str, object]] = []
+        cursor: Optional[str] = None
+        page_size = min(30, limit)  # API max page size is 30
+
+        while len(all_notes) < limit:
+            params = [f"page_size={page_size}"]
+            if created_after:
+                params.append(f"created_after={created_after}")
+            if cursor:
+                params.append(f"cursor={cursor}")
+
+            url = f"{self.api_base}/v1/notes?{'&'.join(params)}"
+            data = self._make_request(url)
+
+            notes = data.get("notes", [])
+            if not isinstance(notes, list):
+                raise GranolaParseError(
+                    "Invalid response format: 'notes' field is not a list"
+                )
+
+            all_notes.extend(notes)
+
+            has_more = data.get("hasMore", False)
+            cursor = data.get("cursor")
+
+            if not has_more or not cursor:
+                break
+
+        return all_notes[:limit]
 
     def get_documents(
         self,
@@ -215,59 +227,71 @@ class RemoteApiDocumentSource(DocumentSource):
         include_last_viewed_panel: bool = True,
         force: bool = False,
     ) -> List[Dict[str, object]]:
-        """Fetch documents from API with caching.
-        
+        """Fetch notes from the public API with caching.
+
+        The `offset` and `include_last_viewed_panel` parameters are accepted
+        for interface compatibility but are not used by the public API.
+
         Args:
-            limit: Maximum documents to fetch (default 100).
-            offset: Pagination offset (default 0).
-            include_last_viewed_panel: Include panel data.
+            limit: Maximum notes to fetch (default 100).
+            offset: Ignored (public API uses cursor pagination).
+            include_last_viewed_panel: Ignored (not supported by public API).
             force: Bypass cache and fetch fresh data.
-            
+
         Returns:
-            List of document dictionaries.
+            List of note dictionaries.
         """
         limit = limit or 100
-        offset = offset or 0
-        
-        # Check cache first
-        cache_key = self._get_cache_key(limit, offset, include_last_viewed_panel)
+
+        cache_key = f"notes_limit{limit}"
         cache_path = self._get_cache_path(cache_key)
-        
+
         if not force and self._is_cache_fresh(cache_path):
             cached = self._read_cache(cache_path)
-            if cached is not None:
-                docs = cached.get("docs", [])
-                if isinstance(docs, list):
-                    return docs
-        
-        # Fetch from API
-        data = self._fetch_from_api(limit, offset, include_last_viewed_panel)
-        
-        # Cache the response
-        self._write_cache(cache_path, data)
-        
-        # Extract documents
-        docs = data.get("docs", [])
-        if not isinstance(docs, list):
-            raise GranolaParseError(
-                "Invalid response format: 'docs' field is not a list"
-            )
-        
-        return docs
+            if isinstance(cached, list):
+                return cached
+
+        notes = self._fetch_from_api(limit=limit)
+
+        self._write_cache(cache_path, notes)
+        return notes
 
     def get_document_by_id(
         self, doc_id: str, *, force: bool = False
     ) -> Optional[Dict[str, object]]:
-        """Fetch a single document by ID.
-        
-        Note: This implementation fetches all documents and filters.
-        A more efficient implementation would use a dedicated endpoint.
+        """Fetch a single note by ID from GET /v1/notes/{id}?include=transcript.
+
+        Includes full detail: attendees, summary_text, summary_markdown,
+        transcript, calendar_event, folder_membership.
+
+        Args:
+            doc_id: Note ID (not_xxx format).
+            force: Bypass cache and fetch fresh data.
+
+        Returns:
+            Note dictionary with full detail, or None on 404.
         """
-        docs = self.get_documents(force=force)
-        for doc in docs:
-            if isinstance(doc, dict) and doc.get("id") == doc_id:
-                return doc
-        return None
+        cache_path = self._get_cache_path(f"note_{doc_id}")
+
+        if not force and self._is_cache_fresh(cache_path):
+            cached = self._read_cache(cache_path)
+            if isinstance(cached, dict):
+                return cached
+
+        url = f"{self.api_base}/v1/notes/{doc_id}?include=transcript"
+        try:
+            data = self._make_request(url)
+        except GranolaParseError as e:
+            context = e.args[1] if len(e.args) > 1 else {}
+            if isinstance(context, dict) and context.get("status") == 404:
+                return None
+            raise
+
+        if not isinstance(data, dict):
+            return None
+
+        self._write_cache(cache_path, data)
+        return data
 
     def refresh_cache(self) -> None:
         """Clear all cache files to force refresh on next request."""
@@ -281,14 +305,14 @@ class RemoteApiDocumentSource(DocumentSource):
         """Get information about the remote cache state."""
         cache_files = list(self.cache_dir.glob("docs_*.json"))
         total_size = sum(f.stat().st_size for f in cache_files)
-        
+
         oldest_cache = None
         if cache_files:
             oldest = min(cache_files, key=lambda f: f.stat().st_mtime)
             oldest_cache = datetime.fromtimestamp(
                 oldest.stat().st_mtime, tz=timezone.utc
             ).isoformat()
-        
+
         return {
             "source": "remote_api",
             "api_base": self.api_base,
