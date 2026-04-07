@@ -131,21 +131,17 @@ class RemoteApiDocumentSource(DocumentSource):
         for attempt in range(max_retries):
             try:
                 with request.urlopen(req, timeout=30) as response:
-                    # Read gzipped response
-                    compressed_data = response.read()
-                    
-                    # Decompress
+                    raw_data = response.read()
+
+                    # Try gzip decompression, fall back to raw
                     try:
-                        decompressed_data = gzip.decompress(compressed_data)
-                    except Exception as e:
-                        raise GranolaParseError(
-                            f"Failed to decompress response: {e}",
-                            {"attempt": attempt + 1}
-                        ) from e
-                    
+                        body = gzip.decompress(raw_data)
+                    except Exception:
+                        body = raw_data
+
                     # Parse JSON
                     try:
-                        data = json.loads(decompressed_data.decode("utf-8"))
+                        data = json.loads(body.decode("utf-8"))
                         return data
                     except Exception as e:
                         raise GranolaParseError(
