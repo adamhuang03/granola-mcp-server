@@ -42,7 +42,7 @@ class DocumentSourceAdapter:
         if self._cache is not None and not force_reload:
             return self._cache
 
-        docs = self._source.get_documents(force=force_reload)
+        docs = self._source.get_documents(force=True)
 
         # Convert list to dict keyed by id
         documents_dict: Dict[str, Dict[str, Any]] = {}
